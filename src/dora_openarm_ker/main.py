@@ -82,21 +82,78 @@ class OnlineHampelFilter:
         return filtered_values.tolist()
 
 
+class OneEuroFilter:
+    """Per-channel 1 Euro Filter: smooths jitter at rest, follows fast motion.
+
+    The cutoff frequency rises with the filtered speed:
+    cutoff = min_cutoff + beta * |velocity|. Units follow the input
+    (here rad and rad/s).
+    """
+
+    def __init__(self, min_cutoff=5.0, beta=5.0, d_cutoff=5.0):
+        """Initialize the filter parameters and empty state."""
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(dt, cutoff):
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def process(self, t: float, values: np.ndarray) -> np.ndarray:
+        """Filter one multi-channel sample taken at monotonic time t (seconds)."""
+        x = np.asarray(values, dtype=np.float64)
+
+        if self.t_prev is None:
+            self.x_prev = x.copy()
+            self.dx_prev = np.zeros_like(x)
+            self.t_prev = t
+            return x
+
+        dt = t - self.t_prev
+        if dt <= 0.0:
+            return self.x_prev.copy()
+
+        dx = (x - self.x_prev) / dt
+        alpha_d = self._alpha(dt, self.d_cutoff)
+        dx_hat = alpha_d * dx + (1.0 - alpha_d) * self.dx_prev
+
+        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
+        alpha = self._alpha(dt, cutoff)
+        x_hat = alpha * x + (1.0 - alpha) * self.x_prev
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t
+        return x_hat.copy()
+
+
 # ==============================================================================
 # Core Processor
 # ==============================================================================
 class KerPoseProcessor:
     """Processes raw angles and applies filters without modifying the physical scale."""
 
-    def __init__(self, use_hampel: bool = False):
-        """Initialize the pose processor with an optional Hampel filter."""
+    def __init__(
+        self,
+        use_hampel: bool = False,
+        one_euro: OneEuroFilter | None = None,
+    ):
+        """Initialize the pose processor with optional Hampel and 1 Euro filters."""
         self.hampel = (
             OnlineHampelFilter(window_size=5, n_sigmas=3.0, min_threshold=5.0)
             if use_hampel
             else None
         )
+        self.one_euro = one_euro
 
-    def process(self, raw_angles: list[float]) -> tuple[list[float], list[float]]:
+    def process(
+        self, raw_angles: list[float], t: float | None = None
+    ) -> tuple[list[float], list[float]]:
         """Filter raw encoder degrees and transform them into left/right radian lists."""
         filtered = self.hampel.process(raw_angles) if self.hampel else raw_angles
 
@@ -109,6 +166,13 @@ class KerPoseProcessor:
         pos_left = np.deg2rad(filtered[8:15]).tolist()
         pos_left.append(np.deg2rad(grip_l_deg))
 
+        if self.one_euro is not None:
+            t = time.perf_counter() if t is None else t
+            # Arm joints only: grippers stay raw for grasp timing.
+            smoothed = self.one_euro.process(t, pos_right[:7] + pos_left[:7]).tolist()
+            pos_right = smoothed[:7] + pos_right[7:]
+            pos_left = smoothed[7:] + pos_left[7:]
+
         return pos_right, pos_left
 
 
@@ -119,6 +183,29 @@ def main():
     """Act OpenArm KER as a leader of OpenArm."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--hampel", action="store_true", help="Enable Hampel filter")
+    parser.add_argument(
+        "--one-euro", action="store_true", help="Enable 1 Euro filter on joints"
+    )
+    parser.add_argument(
+        "--min-cutoff",
+        type=float,
+        default=5.0,
+        help="1 Euro cutoff in Hz at rest; higher = less lag, more jitter "
+        "(default: 5.0).",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=5.0,
+        help="1 Euro cutoff increase in Hz per rad/s; higher = less lag "
+        "when moving (default: 5.0).",
+    )
+    parser.add_argument(
+        "--d-cutoff",
+        type=float,
+        default=5.0,
+        help="1 Euro cutoff in Hz for the velocity estimate (default: 5.0).",
+    )
     args = parser.parse_args()
 
     print("Connecting to KER device...")
@@ -134,7 +221,14 @@ def main():
 
     print("Initializing dora-rs node...")
     node = dora.Node()
-    processor = KerPoseProcessor(use_hampel=args.hampel)
+    one_euro = (
+        OneEuroFilter(
+            min_cutoff=args.min_cutoff, beta=args.beta, d_cutoff=args.d_cutoff
+        )
+        if args.one_euro
+        else None
+    )
+    processor = KerPoseProcessor(use_hampel=args.hampel, one_euro=one_euro)
 
     print("KER Leader Node Running successfully.\n")
     ### send metadata
